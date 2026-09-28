@@ -636,6 +636,17 @@ static int adin1140_send_frame(const struct device *dev, struct net_pkt *pkt)
 			hdr |= FIELD_PREP(OA_DATA_HDR_EV, 1) | FIELD_PREP(OA_DATA_HDR_EBO, ebo);
 		}
 
+#ifdef CONFIG_ETH_ADIN1140_TIMESTAMP
+		/* Set on every chunk, not just the last -- the MAC-PHY likely
+		 * needs to know a frame is capture-requested from its very
+		 * first chunk, not decide retroactively once transmission is
+		 * already underway.
+		 */
+		if (net_pkt_is_tx_timestamping(pkt)) {
+			hdr |= FIELD_PREP(ADIN1140_DATA_HDR_TSC, ADIN1140_TSC_CAPTURE_A);
+		}
+#endif
+
 		/* Get parity bit and place chunk header in Tx buffer */
 		hdr |= FIELD_PREP(OA_DATA_HDR_P, oa_tc6_get_parity(hdr));
 
@@ -662,7 +673,53 @@ static int adin1140_send_frame(const struct device *dev, struct net_pkt *pkt)
 		return rc;
 	}
 
-	return adin1140_process_rx_chunks(dev, total_chunks);
+	rc = adin1140_process_rx_chunks(dev, total_chunks);
+	if (rc < 0) {
+		return rc;
+	}
+
+#ifdef CONFIG_ETH_ADIN1140_TIMESTAMP
+	if (net_pkt_is_tx_timestamping(pkt)) {
+		uint32_t status0 = 0;
+		uint32_t sec, ns;
+		struct net_ptp_time ts;
+		int retry;
+
+		/* The SPI transfer only hands the frame to the MAC-PHY's own
+		 * TX queue -- actual departure onto the (possibly
+		 * PLCA-arbitrated) wire, and therefore the capture, can lag
+		 * behind by more than one poll interval.
+		 */
+		for (retry = 0; retry < ADIN1140_TTSCAA_POLL_MAX_RETRIES; retry++) {
+			int reg_rc = oa_tc6_reg_read(tc6, ADIN1140_MAC_STATUS0, &status0);
+
+			if (reg_rc < 0) {
+				LOG_WRN("TX ts: MAC_STATUS0 read failed [%d] (retry=%d)",
+					reg_rc, retry);
+			} else if (status0 & ADIN1140_MAC_STATUS0_TTSCAA) {
+				break;
+			}
+			k_sleep(K_USEC(ADIN1140_TTSCAA_POLL_INTERVAL_US));
+		}
+
+		if (status0 & ADIN1140_MAC_STATUS0_TTSCAA) {
+			oa_tc6_reg_read(tc6, ADIN1140_MAC_TTSCAH, &sec);
+			oa_tc6_reg_read(tc6, ADIN1140_MAC_TTSCAL, &ns);
+			/* Write-1-to-clear, matching MAC_STATUS0's other bits. */
+			oa_tc6_reg_write(tc6, ADIN1140_MAC_STATUS0,
+					 ADIN1140_MAC_STATUS0_TTSCAA);
+
+			ts.second = sec;
+			ts.nanosecond = ns;
+			net_pkt_set_timestamp(pkt, &ts);
+			net_if_call_timestamp_cb(pkt);
+		} else {
+			LOG_WRN("TX timestamp capture timed out");
+		}
+	}
+#endif
+
+	return 0;
 }
 
 /**
